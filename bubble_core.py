@@ -408,118 +408,111 @@ class BubbleTracker:
         if not dets:
             return active, tentative, finished, next_id
 
-        if not active:
-            # No active tracks — all detections become tentative
-            for d in dets:
-                tentative.append(self._new_track(next_id, fi, d, cfg))
-                next_id += 1
-            return active, tentative, finished, next_id
-
-        # ── KD-tree spatial indexing ──
-        det_positions = np.array([[d["x"], d["y"]] for d in dets])
-        tree = cKDTree(det_positions)
-
-        n_t = len(active)
         n_d = len(dets)
-
-        # For each track, find candidate detections within max_dist
-        track_preds = []
-        track_candidates = []  # list of lists of detection indices
-        for ti, t in enumerate(active):
-            dt = fi - t["last_frame"]
-            if use_kalman and "kalman" in t:
-                # Predict using Kalman filter
-                kf = t["kalman"]
-                # Set transition matrix dt
-                kf.transitionMatrix[0, 2] = float(dt)
-                kf.transitionMatrix[1, 3] = float(dt)
-                pred = kf.predict()
-                pred_x, pred_y = float(pred[0]), float(pred[1])
-            else:
-                pred_x = t["last_x"] + t["vx"] * dt
-                pred_y = t["last_y"] + t["vy"] * dt
-            track_preds.append((pred_x, pred_y))
-            candidates = tree.query_ball_point([pred_x, pred_y], max_dist)
-            track_candidates.append(set(candidates))
-
-        # ── Build sparse adjacency and find connected components ──
-        # Nodes: tracks [0..n_t-1], detections [n_t..n_t+n_d-1]
-        rows, cols = [], []
-        for ti in range(n_t):
-            for di in track_candidates[ti]:
-                rows.append(ti)
-                cols.append(n_t + di)
-                rows.append(n_t + di)
-                cols.append(ti)
-
         matched_dets = set()
         alpha = cfg["velocity_alpha"]
 
-        if rows:
-            total_nodes = n_t + n_d
-            adj = csr_matrix(
-                (np.ones(len(rows), dtype=np.int8), (rows, cols)),
-                shape=(total_nodes, total_nodes))
-            n_components, comp_labels = connected_components(adj, directed=False)
+        # ── Active track matching (only if there are active tracks) ──
+        if active:
+            # KD-tree spatial indexing
+            det_positions = np.array([[d["x"], d["y"]] for d in dets])
+            tree = cKDTree(det_positions)
 
-            # Solve each connected component independently
-            for comp_id in range(n_components):
-                comp_mask = comp_labels == comp_id
-                comp_track_idxs = [i for i in range(n_t) if comp_mask[i]]
-                comp_det_idxs = [i - n_t for i in range(n_t, total_nodes) if comp_mask[i]]
+            n_t = len(active)
 
-                if not comp_track_idxs or not comp_det_idxs:
-                    continue
+            # For each track, find candidate detections within max_dist
+            track_preds = []
+            track_candidates = []  # list of sets of detection indices
+            for ti, t in enumerate(active):
+                dt = fi - t["last_frame"]
+                if use_kalman and "kalman" in t:
+                    kf = t["kalman"]
+                    kf.transitionMatrix[0, 2] = float(dt)
+                    kf.transitionMatrix[1, 3] = float(dt)
+                    pred = kf.predict()
+                    pred_x, pred_y = float(pred[0]), float(pred[1])
+                else:
+                    pred_x = t["last_x"] + t["vx"] * dt
+                    pred_y = t["last_y"] + t["vy"] * dt
+                track_preds.append((pred_x, pred_y))
+                candidates = tree.query_ball_point([pred_x, pred_y], max_dist)
+                track_candidates.append(set(candidates))
 
-                # Build sub-cost-matrix for this component
-                nt_c = len(comp_track_idxs)
-                nd_c = len(comp_det_idxs)
-                sub_cost = np.full((nt_c, nd_c), 1e6)
+            # Build sparse adjacency and find connected components
+            # Nodes: tracks [0..n_t-1], detections [n_t..n_t+n_d-1]
+            rows, cols = [], []
+            for ti in range(n_t):
+                for di in track_candidates[ti]:
+                    rows.append(ti)
+                    cols.append(n_t + di)
+                    rows.append(n_t + di)
+                    cols.append(ti)
 
-                for si, ti in enumerate(comp_track_idxs):
-                    pred_x, pred_y = track_preds[ti]
-                    t = active[ti]
-                    for sj, di in enumerate(comp_det_idxs):
-                        if di not in track_candidates[ti]:
-                            continue
-                        d = dets[di]
-                        # Multi-feature cost
-                        dist = np.hypot(pred_x - d["x"], pred_y - d["y"])
-                        area_diff = abs(t.get("last_area", d["area"]) - d["area"]) / max(t.get("last_area", d["area"]), 1)
-                        inten_diff = abs(t.get("last_intensity", d["intensity"]) - d["intensity"]) / 255.0
-                        sub_cost[si, sj] = w_dist * dist + w_area * area_diff * max_dist + w_inten * inten_diff * max_dist
+            if rows:
+                total_nodes = n_t + n_d
+                adj = csr_matrix(
+                    (np.ones(len(rows), dtype=np.int8), (rows, cols)),
+                    shape=(total_nodes, total_nodes))
+                n_components, comp_labels = connected_components(adj, directed=False)
 
-                row_ind, col_ind = linear_sum_assignment(sub_cost)
+                # Solve each connected component independently
+                for comp_id in range(n_components):
+                    comp_mask = comp_labels == comp_id
+                    comp_track_idxs = [i for i in range(n_t) if comp_mask[i]]
+                    comp_det_idxs = [i - n_t for i in range(n_t, total_nodes) if comp_mask[i]]
 
-                for ri, ci in zip(row_ind, col_ind):
-                    if sub_cost[ri, ci] >= 1e5:
+                    if not comp_track_idxs or not comp_det_idxs:
                         continue
-                    ti = comp_track_idxs[ri]
-                    di = comp_det_idxs[ci]
-                    d = dets[di]
-                    t = active[ti]
-                    dt = fi - t["last_frame"]
 
-                    if use_kalman and "kalman" in t:
-                        meas = np.array([[d["x"]], [d["y"]]], dtype=np.float32)
-                        t["kalman"].correct(meas)
-                        state = t["kalman"].statePost
-                        t["vx"] = float(state[2])
-                        t["vy"] = float(state[3])
-                    else:
-                        if dt > 0:
-                            nvx = (d["x"] - t["last_x"]) / dt
-                            nvy = (d["y"] - t["last_y"]) / dt
-                            t["vx"] = alpha * nvx + (1 - alpha) * t["vx"]
-                            t["vy"] = alpha * nvy + (1 - alpha) * t["vy"]
+                    # Build sub-cost-matrix for this component
+                    nt_c = len(comp_track_idxs)
+                    nd_c = len(comp_det_idxs)
+                    sub_cost = np.full((nt_c, nd_c), 1e6)
 
-                    t["points"].append((fi, d["x"], d["y"], d["area"], d["radius"]))
-                    t["last_frame"] = fi
-                    t["last_x"] = d["x"]
-                    t["last_y"] = d["y"]
-                    t["last_area"] = d["area"]
-                    t["last_intensity"] = d["intensity"]
-                    matched_dets.add(di)
+                    for si, ti in enumerate(comp_track_idxs):
+                        pred_x, pred_y = track_preds[ti]
+                        t = active[ti]
+                        for sj, di in enumerate(comp_det_idxs):
+                            if di not in track_candidates[ti]:
+                                continue
+                            d = dets[di]
+                            # Multi-feature cost
+                            dist = np.hypot(pred_x - d["x"], pred_y - d["y"])
+                            area_diff = abs(t.get("last_area", d["area"]) - d["area"]) / max(t.get("last_area", d["area"]), 1)
+                            inten_diff = abs(t.get("last_intensity", d["intensity"]) - d["intensity"]) / 255.0
+                            sub_cost[si, sj] = w_dist * dist + w_area * area_diff * max_dist + w_inten * inten_diff * max_dist
+
+                    row_ind, col_ind = linear_sum_assignment(sub_cost)
+
+                    for ri, ci in zip(row_ind, col_ind):
+                        if sub_cost[ri, ci] >= 1e5:
+                            continue
+                        ti = comp_track_idxs[ri]
+                        di = comp_det_idxs[ci]
+                        d = dets[di]
+                        t = active[ti]
+                        dt = fi - t["last_frame"]
+
+                        if use_kalman and "kalman" in t:
+                            meas = np.array([[d["x"]], [d["y"]]], dtype=np.float32)
+                            t["kalman"].correct(meas)
+                            state = t["kalman"].statePost
+                            t["vx"] = float(state[2])
+                            t["vy"] = float(state[3])
+                        else:
+                            if dt > 0:
+                                nvx = (d["x"] - t["last_x"]) / dt
+                                nvy = (d["y"] - t["last_y"]) / dt
+                                t["vx"] = alpha * nvx + (1 - alpha) * t["vx"]
+                                t["vy"] = alpha * nvy + (1 - alpha) * t["vy"]
+
+                        t["points"].append((fi, d["x"], d["y"], d["area"], d["radius"]))
+                        t["last_frame"] = fi
+                        t["last_x"] = d["x"]
+                        t["last_y"] = d["y"]
+                        t["last_area"] = d["area"]
+                        t["last_intensity"] = d["intensity"]
+                        matched_dets.add(di)
 
         # ── Gated track spawning: match unmatched dets to tentative tracks ──
         unmatched_det_idxs = [i for i in range(n_d) if i not in matched_dets]
