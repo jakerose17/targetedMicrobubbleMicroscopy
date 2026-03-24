@@ -5,7 +5,7 @@ MicroBubble Tracker — PyQt6 GUI Application (v2)
 Features:
   - Drag-and-drop video loading (1 to many)
   - Per-video magnification (10x/20x/35x/50x) with calibrated pixel scaling
-  - Streaming MOG2 + frame-diff tracking (fast, low memory)
+  - Median-background dark-bubble detection with contrast filtering
   - Velocity-predicted Hungarian linking + automatic track merging
   - Video player with track overlays, play/pause, scrub
   - Track selection, deletion, and manual merging
@@ -378,40 +378,27 @@ class VideoPlayerWidget(QWidget):
 class SettingsDialog(QDialog):
     PARAMS = [
         # Background model
-        ("mog2_var_threshold",     "MOG2 variance threshold",                int),
-        ("mog2_learning_rate",     "MOG2 learning rate",                     float),
-        # Frame-diff gating
-        ("frame_diff_threshold",   "Frame-diff threshold",                   int),
-        ("frame_diff_dilate",      "Frame-diff dilation iters",              int),
-        ("frame_diff_mode",        "Frame-diff mode (fixed/adaptive/off)",   str),
-        ("frame_diff_adaptive_pct","Adaptive percentile (0-100)",            int),
-        # Blob filtering
+        ("bg_n_samples",           "Background sample frames",               int),
+        # Detection
+        ("bg_sub_threshold",       "Background subtract threshold",          int),
+        ("min_contrast",           "Min contrast vs background",             int),
+        ("min_circularity",        "Min circularity (0-1)",                  float),
         ("min_blob_area_px",       "Min blob area (px^2)",                   int),
         ("max_blob_area_px",       "Max blob area (px^2)",                   int),
         ("morph_kernel_size",      "Morphology kernel (px)",                 int),
-        ("gaussian_blur_ksize",    "Gaussian blur kernel (px)",              int),
-        # Watershed splitting
-        ("enable_watershed_split", "Enable watershed splitting (True/False)",str),
-        ("dist_transform_threshold","Watershed dist threshold (0-1)",        float),
-        # Linking — cost weights
+        # Linking
         ("max_link_distance_px",   "Max linking distance (px)",              int),
         ("max_frame_skip",         "Max frame gap for linking",              int),
         ("velocity_alpha",         "Velocity EMA alpha",                     float),
-        ("cost_weight_distance",   "Cost weight: distance",                  float),
-        ("cost_weight_area",       "Cost weight: area similarity",           float),
-        ("cost_weight_intensity",  "Cost weight: intensity similarity",      float),
-        # Gated spawning
-        ("min_confirm_frames",     "Confirm frames (tentative->active)",     int),
+        ("area_cost_weight",       "Area cost weight (tie-breaking)",        float),
         # Track classification
         ("min_track_length",       "Min track length (detections)",          int),
         ("min_displacement_px",    "Min displacement for 'moving' (px)",     float),
         # Merging
         ("merge_max_gap_frames",   "Merge max gap (frames)",                 int),
         ("merge_max_distance_px",  "Merge max distance (px)",                int),
-        # Kalman filter
-        ("use_kalman",             "Use Kalman filter (True/False)",         str),
-        ("kalman_process_noise",   "Kalman process noise",                   float),
-        ("kalman_measurement_noise","Kalman measurement noise",              float),
+        # Velocity smoothing
+        ("velocity_median_window", "Velocity median filter window",          int),
     ]
 
     def __init__(self, config, parent=None):
@@ -447,33 +434,16 @@ class SettingsDialog(QDialog):
             edit.setText(str(DEFAULT_CONFIG[key]))
 
     def _validate_and_accept(self):
-        bool_keys = {"enable_watershed_split", "use_kalman"}
-        choice_keys = {"frame_diff_mode": {"fixed", "adaptive", "off"}}
         for key, (edit, dtype) in self.edits.items():
             val = edit.text().strip()
-            if key in bool_keys:
-                if val.lower() not in ("true", "false"):
-                    QMessageBox.warning(self, "Invalid", f"'{key}' must be True or False")
-                    return
-            elif key in choice_keys:
-                if val not in choice_keys[key]:
-                    QMessageBox.warning(self, "Invalid",
-                        f"'{key}' must be one of: {', '.join(choice_keys[key])}")
-                    return
-            else:
-                try:
-                    dtype(val)
-                except ValueError:
-                    QMessageBox.warning(self, "Invalid", f"Bad value for '{key}'")
-                    return
+            try:
+                dtype(val)
+            except ValueError:
+                QMessageBox.warning(self, "Invalid", f"Bad value for '{key}'")
+                return
         for key, (edit, dtype) in self.edits.items():
             val = edit.text().strip()
-            if key in bool_keys:
-                self.config[key] = val.lower() == "true"
-            elif key in choice_keys:
-                self.config[key] = val
-            else:
-                self.config[key] = dtype(val)
+            self.config[key] = dtype(val)
         self.accept()
 
 
