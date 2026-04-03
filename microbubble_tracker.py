@@ -386,6 +386,11 @@ class SettingsDialog(QDialog):
         ("min_blob_area_px",       "Min blob area (px^2)",                   int),
         ("max_blob_area_px",       "Max blob area (px^2)",                   int),
         ("morph_kernel_size",      "Morphology kernel (px)",                 int),
+        # Focus quality
+        ("min_fill_ratio",         "Min fill ratio (0-1)",                   float),
+        ("min_solidity",           "Min solidity (0-1, 0=off)",              float),
+        ("min_focus_score",        "Min focus score (0-1, 0=off)",           float),
+        ("focus_cost_weight",      "Focus cost weight (linking)",            float),
         # Linking
         ("max_link_distance_px",   "Max linking distance (px)",              int),
         ("max_frame_skip",         "Max frame gap for linking",              int),
