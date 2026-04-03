@@ -1,37 +1,38 @@
 """
-bubble_core.py — Microbubble detection, tracking, and export engine (v4).
+bubble_core.py — Microbubble detection, tracking, and export engine (v5).
 
-v4 — complete rewrite based on empirical testing on sparse (10x) and dense (35x)
-microbubble videos.
+v5 — Template-matching tracker replaces detect-and-link.
 
-Detection:
-  - Temporal median background model (no MOG2 — bubbles are persistent, not
-    transient foreground)
+Tracks bubbles the way a human eye does:
+  1. Selective initialization — only high-confidence detections start tracks
+  2. Visual following — each bubble carries a small image template that is
+     matched frame-by-frame via normalized cross-correlation (NCC)
+  3. Inertia enforcement — velocity prediction centers the search window;
+     physically impossible jumps are rejected
+  4. Post-hoc validation — tracks are split at acceleration spikes that
+     indicate mistracking
+
+Detection (for track spawning only):
+  - Temporal median background model
   - Background-subtracted dark-pixel detection (bg - frame > threshold)
-  - Contrast + circularity filtering to reject out-of-focus halos and noise
-  - Fast per-contour intensity via bounding-rect cropping (not full-frame masks)
+  - Contrast + circularity filtering
 
-Linking:
-  - Tight search radius (12px default, tuned to median bubble movement ~5px/frame)
-  - KD-tree spatial indexing + Hungarian assignment
-  - Velocity-predicted position for gap-closing
-  - Area-weighted cost for tie-breaking among nearby candidates
-  - No gated spawning — simple min_track_length filter is sufficient
-
-Merging:
-  - Velocity-extrapolated fragment merging with KD-tree acceleration
-  - Reconnects tracks broken by 1-frame detection dropouts
+Tracking:
+  - Per-track appearance template (patch_size x patch_size pixels)
+  - NCC template matching in a small search window around predicted position
+  - Slow template adaptation to handle gradual focus/appearance changes
+  - Periodic re-detection to spawn tracks for newly arriving bubbles
 
 Post-processing:
-  - Median velocity filter removes residual spikes from rare track-swaps
+  - Acceleration-based track splitting (inertia validation)
+  - Velocity-extrapolated fragment merging
+  - Median velocity filter for export
 
 No GUI dependencies. Can be imported for scripting or batch processing.
 """
 
 import cv2
 import numpy as np
-from scipy.optimize import linear_sum_assignment
-from scipy.spatial import cKDTree
 from pathlib import Path
 import json
 import csv
@@ -55,23 +56,24 @@ MAGNIFICATION_MAP = {
 DEFAULT_CONFIG = {
     # Background model
     "bg_n_samples":         50,      # frames sampled for median background
-    # Detection
+    # Detection (used for track spawning)
     "bg_sub_threshold":     10,      # min (background - frame) to detect dark bubble
     "min_contrast":         8,       # min mean contrast vs background inside contour
     "min_circularity":      0.20,    # reject non-circular blobs (0-1)
     "min_blob_area_px":     5,       # minimum contour area
     "max_blob_area_px":     5000,    # maximum contour area
     "morph_kernel_size":    3,       # morphological cleanup kernel
-    # Focus quality (out-of-focus ring rejection)
-    "min_fill_ratio":       0.35,   # min contour_area / enclosing_circle_area
-    "min_solidity":         0.0,    # min contour_area / convex_hull_area (0=off)
-    "min_focus_score":      0.0,    # min composite focus score (0=off)
-    "focus_cost_weight":    1.5,    # penalty in linking cost for low focus score
-    # Linking
-    "max_link_distance_px": 12,      # max distance for frame-to-frame linking
-    "max_frame_skip":       3,       # max frames a track can skip
+    # Template tracking
+    "patch_size":           21,      # appearance template size (pixels, odd)
+    "search_margin_px":     12,      # search window around predicted position
+    "min_ncc":              0.7,     # minimum template match score to continue track
+    "template_adapt_rate":  0.05,    # how fast template updates (0=frozen, 1=instant)
+    "spawn_interval":       10,      # re-detect for new bubbles every N frames
+    "spawn_min_distance_px": 15,     # don't spawn near existing tracks
+    "max_frame_skip":       3,       # max consecutive lost frames before termination
     "velocity_alpha":       0.4,     # EMA smoothing for velocity estimate
-    "area_cost_weight":     2.0,     # area-ratio penalty weight in cost
+    # Track validation
+    "max_acceleration_px":  3.0,     # split tracks at acceleration above this (px/f^2)
     # Track classification
     "min_track_length":     5,       # minimum detections to keep a track
     "min_displacement_px":  8.0,     # minimum net displacement to be "moving"
@@ -96,21 +98,22 @@ TRACK_COLORS = [
 
 class BubbleTracker:
     """
-    Single-pass streaming tracker for microbubble microscopy.
+    Template-matching tracker for microbubble microscopy.
 
     Pass 1 (fast): Build temporal median background from sampled frames.
-    Pass 2 (streaming): Detect dark bubbles + link + merge.
+    Pass 2 (streaming): Template-track bubbles frame by frame.
 
-    Tested at densities from 10 to 3000+ bubbles per frame.
+    Each bubble carries a small image patch (template) that is matched
+    in each new frame using normalized cross-correlation. Tracks are
+    initialized from high-confidence detections and validated post-hoc
+    using acceleration constraints (inertia).
     """
 
     def __init__(self, config=None):
         self.config = {**DEFAULT_CONFIG, **(config or {})}
 
     def process_video(self, video_path, progress_cb=None):
-        """
-        Full pipeline. Returns results dict with tracks and metadata.
-        """
+        """Full pipeline. Returns results dict with tracks and metadata."""
         cfg = self.config
         cap = cv2.VideoCapture(str(video_path))
         if not cap.isOpened():
@@ -121,7 +124,7 @@ class BubbleTracker:
         width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
 
-        total_steps = n_frames + 30  # for progress bar
+        total_steps = n_frames + 30
 
         # ── Pass 1: Build median background ──
         if progress_cb:
@@ -129,17 +132,16 @@ class BubbleTracker:
 
         background = self._compute_background(cap, n_frames, cfg["bg_n_samples"])
 
-        # Read first frame for display purposes
         cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
         ret, first_bgr = cap.read()
-        first_frame = cv2.cvtColor(first_bgr, cv2.COLOR_BGR2GRAY) if ret else background.copy()
+        first_frame = (cv2.cvtColor(first_bgr, cv2.COLOR_BGR2GRAY)
+                       if ret else background.copy())
 
-        # ── Pass 2: Detect + Link (streaming) ──
+        # ── Pass 2: Template tracking ──
         if progress_cb:
-            progress_cb("Detecting & linking...", 5, total_steps)
+            progress_cb("Tracking bubbles...", 5, total_steps)
 
         cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-
         kernel = cv2.getStructuringElement(
             cv2.MORPH_ELLIPSE,
             (cfg["morph_kernel_size"], cfg["morph_kernel_size"]))
@@ -149,6 +151,9 @@ class BubbleTracker:
         next_id = 0
         all_detections = []
 
+        half = cfg["patch_size"] // 2
+        spawn_interval = cfg["spawn_interval"]
+
         actual_frames = 0
         for fi in range(n_frames):
             ret, frame = cap.read()
@@ -157,16 +162,51 @@ class BubbleTracker:
             actual_frames += 1
             gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
 
-            # Detect dark bubbles via background subtraction
-            dets = self._detect_frame(gray, background, kernel, cfg)
-            all_detections.append(dets)
+            # Spawn new tracks periodically
+            if fi % spawn_interval == 0:
+                dets = self._detect_frame(gray, background, kernel, cfg)
+                next_id = self._spawn_tracks(
+                    dets, gray, fi, active_tracks, next_id, cfg)
+            else:
+                dets = []
 
-            # Link detections to tracks
-            active_tracks, finished_tracks, next_id = self._link_frame(
-                fi, dets, active_tracks, finished_tracks, next_id, cfg)
+            # Template-match all active tracks
+            still_active = []
+            for t in active_tracks:
+                if t["points"][-1][0] == fi:
+                    # Just spawned this frame, skip tracking
+                    still_active.append(t)
+                    continue
+
+                matched = self._track_template(t, gray, fi, cfg)
+                if matched:
+                    t["lost_count"] = 0
+                    still_active.append(t)
+                else:
+                    t["lost_count"] = t.get("lost_count", 0) + 1
+                    if t["lost_count"] < cfg["max_frame_skip"]:
+                        still_active.append(t)
+                    else:
+                        finished_tracks.append(t)
+
+            active_tracks = still_active
+
+            # Synthesize detection list for GUI compatibility
+            frame_dets = []
+            for t in active_tracks:
+                if t["points"][-1][0] == fi:
+                    pt = t["points"][-1]
+                    frame_dets.append({
+                        "x": pt[1], "y": pt[2],
+                        "area": t["init_area"],
+                        "radius": t["init_radius"],
+                        "intensity": 0,
+                        "contrast": t.get("init_contrast", 0),
+                    })
+            all_detections.append(frame_dets)
 
             if progress_cb and fi % 30 == 0:
-                progress_cb("Detecting & linking...", 5 + fi, total_steps)
+                progress_cb("Tracking bubbles...", 5 + fi, total_steps)
 
         cap.release()
 
@@ -177,10 +217,13 @@ class BubbleTracker:
         finished_tracks.extend(active_tracks)
 
         if progress_cb:
-            progress_cb("Merging track fragments...", 5 + actual_frames, total_steps)
+            progress_cb("Validating tracks...", 5 + actual_frames, total_steps)
+
+        # ── Validate tracks (split at acceleration spikes) ──
+        tracks = self._validate_tracks(finished_tracks, cfg)
 
         # ── Merge fragmented tracks ──
-        tracks = self._merge_tracks(finished_tracks, cfg)
+        tracks = self._merge_tracks(tracks, cfg)
 
         # ── Classify ──
         moving, static = self._classify_tracks(tracks, cfg)
@@ -220,37 +263,26 @@ class BubbleTracker:
 
         return np.median(np.array(samples), axis=0).astype(np.uint8)
 
-    # ── Per-frame detection ─────────────────────────────────────────────────
+    # ── Detection (for track spawning) ─────────────────────────────────────
 
     @staticmethod
     def _detect_frame(gray, background, kernel, cfg):
         """
         Detect dark bubbles via background subtraction.
 
-        Bubbles are darker than the backlit background, so we compute
-        (background - frame) and threshold to find dark regions.
-        Contrast and circularity filters reject out-of-focus halos and noise.
+        Used only for spawning new tracks, not for frame-to-frame linking.
         """
         bg_thresh = cfg["bg_sub_threshold"]
         min_area = cfg["min_blob_area_px"]
         max_area = cfg["max_blob_area_px"]
         min_contrast = cfg["min_contrast"]
         min_circ = cfg["min_circularity"]
-        min_fill = cfg.get("min_fill_ratio", 0)
-        min_sol = cfg.get("min_solidity", 0)
-        min_fscore = cfg.get("min_focus_score", 0)
 
-        # Background subtraction: bubbles are darker than background
-        diff = cv2.subtract(background, gray)  # clips negative to 0
-
-        # Threshold
+        diff = cv2.subtract(background, gray)
         _, mask = cv2.threshold(diff, bg_thresh, 255, cv2.THRESH_BINARY)
-
-        # Morphological cleanup
         mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
         mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
 
-        # Find contours
         contours, _ = cv2.findContours(
             mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
@@ -266,13 +298,11 @@ class BubbleTracker:
             cx = M["m10"] / M["m00"]
             cy = M["m01"] / M["m00"]
 
-            # Circularity filter
             perim = cv2.arcLength(c, True)
             circ = 4 * np.pi * area / (perim * perim) if perim > 0 else 0
             if circ < min_circ:
                 continue
 
-            # Fast intensity via bounding-rect crop (not full-frame mask)
             x, y, w, h = cv2.boundingRect(c)
             roi_mask = np.zeros((h, w), dtype=np.uint8)
             cv2.drawContours(roi_mask, [c - np.array([x, y])], -1, 255, -1)
@@ -284,37 +314,6 @@ class BubbleTracker:
             if contrast < min_contrast:
                 continue
 
-            # Focus-quality features (distinguish solid dots from rings)
-            _, enc_radius = cv2.minEnclosingCircle(c)
-            enc_area = np.pi * enc_radius * enc_radius
-            fill_ratio = area / enc_area if enc_area > 0 else 0
-
-            if fill_ratio < min_fill:
-                continue
-
-            hull = cv2.convexHull(c)
-            hull_area = cv2.contourArea(hull)
-            solidity = area / hull_area if hull_area > 0 else 0
-
-            if solidity < min_sol:
-                continue
-
-            # Peak intensity difference within contour
-            diff_roi = diff[y:y+h, x:x+w]
-            peak_diff = float(np.max(diff_roi, where=roi_mask > 0,
-                                     initial=0))
-
-            # Composite focus score (0-1)
-            norm_contrast = min(contrast / 30.0, 1.0)
-            norm_fill = min(fill_ratio / 0.7, 1.0)
-            norm_solidity = min(solidity / 0.95, 1.0)
-            norm_peak = min(peak_diff / 40.0, 1.0)
-            focus_score = (0.30 * norm_contrast + 0.35 * norm_fill
-                           + 0.15 * norm_solidity + 0.20 * norm_peak)
-
-            if focus_score < min_fscore:
-                continue
-
             dets.append({
                 "x": cx,
                 "y": cy,
@@ -322,108 +321,179 @@ class BubbleTracker:
                 "radius": np.sqrt(area / np.pi),
                 "intensity": mean_int,
                 "contrast": contrast,
-                "fill_ratio": fill_ratio,
-                "solidity": solidity,
-                "peak_diff": peak_diff,
-                "focus_score": focus_score,
             })
 
         return dets
 
-    # ── Frame-to-frame linking ──────────────────────────────────────────────
+    # ── Track spawning ─────────────────────────────────────────────────────
 
     @staticmethod
-    def _link_frame(fi, dets, active, finished, next_id, cfg):
-        """
-        Link detections to active tracks via Hungarian assignment.
+    def _spawn_tracks(dets, gray, fi, active_tracks, next_id, cfg):
+        """Spawn new tracks from detections not near existing tracks."""
+        half = cfg["patch_size"] // 2
+        min_dist = cfg["spawn_min_distance_px"]
+        h_img, w_img = gray.shape
 
-        Uses KD-tree for spatial indexing and velocity prediction for
-        gap-closing. Area ratio is used as a tie-breaker cost.
+        active_positions = [(t["x"], t["y"]) for t in active_tracks]
+
+        for d in dets:
+            cx, cy = d["x"], d["y"]
+
+            # Skip if too close to an existing track
+            too_close = False
+            for ax, ay in active_positions:
+                if abs(cx - ax) < min_dist and abs(cy - ay) < min_dist:
+                    if np.hypot(cx - ax, cy - ay) < min_dist:
+                        too_close = True
+                        break
+            if too_close:
+                continue
+
+            ix, iy = int(round(cx)), int(round(cy))
+            if (iy - half < 0 or iy + half + 1 > h_img
+                    or ix - half < 0 or ix + half + 1 > w_img):
+                continue
+
+            template = gray[iy-half:iy+half+1, ix-half:ix+half+1].astype(
+                np.float32)
+
+            active_tracks.append({
+                "id": next_id,
+                "points": [(fi, cx, cy, d["area"], d["radius"], 1.0)],
+                "x": cx,
+                "y": cy,
+                "vx": 0.0,
+                "vy": 0.0,
+                "template": template,
+                "init_area": d["area"],
+                "init_radius": d["radius"],
+                "init_contrast": d["contrast"],
+                "lost_count": 0,
+            })
+            active_positions.append((cx, cy))
+            next_id += 1
+
+        return next_id
+
+    # ── Template matching per track ────────────────────────────────────────
+
+    @staticmethod
+    def _track_template(track, gray, fi, cfg):
         """
-        max_dist = cfg["max_link_distance_px"]
-        max_skip = cfg["max_frame_skip"]
+        Match a track's template in the current frame.
+
+        Returns True if match found, False otherwise.
+        Updates track position, velocity, template, and appends point.
+        """
+        half = cfg["patch_size"] // 2
+        margin = cfg["search_margin_px"]
+        min_ncc = cfg["min_ncc"]
         alpha = cfg["velocity_alpha"]
-        area_w = cfg["area_cost_weight"]
-        focus_w = cfg.get("focus_cost_weight", 0)
+        adapt = cfg["template_adapt_rate"]
+        h_img, w_img = gray.shape
 
-        # Expire stale tracks
-        still_active = []
-        for t in active:
-            if fi - t["last_frame"] > max_skip:
-                finished.append(t)
-            else:
-                still_active.append(t)
-        active = still_active
+        # Predict position using velocity
+        px = track["x"] + track["vx"]
+        py = track["y"] + track["vy"]
+        ipx, ipy = int(round(px)), int(round(py))
 
-        if not dets:
-            return active, finished, next_id
+        # Define search region
+        sy1 = max(0, ipy - half - margin)
+        sy2 = min(h_img, ipy + half + 1 + margin)
+        sx1 = max(0, ipx - half - margin)
+        sx2 = min(w_img, ipx + half + 1 + margin)
 
-        n_d = len(dets)
-        matched_dets = set()
+        patch_size = cfg["patch_size"]
+        if sy2 - sy1 < patch_size or sx2 - sx1 < patch_size:
+            return False
 
-        if active:
-            det_pos = np.array([[d["x"], d["y"]] for d in dets])
-            tree = cKDTree(det_pos)
-            n_t = len(active)
+        search = gray[sy1:sy2, sx1:sx2].astype(np.float32)
 
-            cost = np.full((n_t, n_d), 1e6)
-            for ti, t in enumerate(active):
-                dt = fi - t["last_frame"]
-                px = t["last_x"] + t["vx"] * dt
-                py = t["last_y"] + t["vy"] * dt
-                cands = tree.query_ball_point([px, py], max_dist)
-                for di in cands:
-                    d = dets[di]
-                    dist = np.hypot(px - d["x"], py - d["y"])
-                    # Area ratio penalty to break ties
-                    area_ratio = (max(t["last_area"], d["area"]) /
-                                  max(min(t["last_area"], d["area"]), 1))
-                    focus_penalty = focus_w * (1.0 - d.get("focus_score", 1.0))
-                    cost[ti, di] = (dist + area_w * (area_ratio - 1.0)
-                                    + focus_penalty)
+        result = cv2.matchTemplate(search, track["template"],
+                                   cv2.TM_CCOEFF_NORMED)
+        _, max_val, _, max_loc = cv2.minMaxLoc(result)
 
-            row_ind, col_ind = linear_sum_assignment(cost)
+        if max_val < min_ncc:
+            return False
 
-            for ri, ci in zip(row_ind, col_ind):
-                if cost[ri, ci] >= 1e5:
+        # Update position
+        new_x = float(sx1 + max_loc[0] + half)
+        new_y = float(sy1 + max_loc[1] + half)
+
+        # Update velocity with EMA
+        nvx = new_x - track["x"]
+        nvy = new_y - track["y"]
+        track["vx"] = alpha * nvx + (1 - alpha) * track["vx"]
+        track["vy"] = alpha * nvy + (1 - alpha) * track["vy"]
+
+        track["x"] = new_x
+        track["y"] = new_y
+        track["points"].append(
+            (fi, new_x, new_y, track["init_area"], track["init_radius"],
+             max_val))
+
+        # Slowly adapt template
+        ix, iy = int(round(new_x)), int(round(new_y))
+        if (iy - half >= 0 and iy + half + 1 <= h_img
+                and ix - half >= 0 and ix + half + 1 <= w_img):
+            new_patch = gray[iy-half:iy+half+1, ix-half:ix+half+1].astype(
+                np.float32)
+            track["template"] = ((1 - adapt) * track["template"]
+                                 + adapt * new_patch)
+
+        return True
+
+    # ── Track validation (inertia check) ───────────────────────────────────
+
+    @staticmethod
+    def _validate_tracks(tracks, cfg):
+        """
+        Split tracks at acceleration spikes that indicate mistracking.
+
+        Bubbles maintain inertia — sudden jumps in velocity direction or
+        magnitude are physically impossible and indicate the tracker locked
+        onto a different bubble.
+        """
+        max_accel = cfg["max_acceleration_px"]
+        if max_accel <= 0:
+            return tracks
+
+        validated = []
+        for t in tracks:
+            pts = t["points"]
+            if len(pts) < 3:
+                validated.append(t)
+                continue
+
+            # Find split points where acceleration exceeds threshold
+            split_indices = []
+            for i in range(2, len(pts)):
+                # Only check consecutive frames
+                if pts[i][0] != pts[i-1][0] + 1 or pts[i-1][0] != pts[i-2][0] + 1:
                     continue
-                t = active[ri]
-                d = dets[ci]
-                dt = fi - t["last_frame"]
+                vx1 = pts[i-1][1] - pts[i-2][1]
+                vy1 = pts[i-1][2] - pts[i-2][2]
+                vx2 = pts[i][1] - pts[i-1][1]
+                vy2 = pts[i][2] - pts[i-1][2]
+                accel = np.hypot(vx2 - vx1, vy2 - vy1)
+                if accel > max_accel:
+                    split_indices.append(i)
 
-                if dt > 0:
-                    nvx = (d["x"] - t["last_x"]) / dt
-                    nvy = (d["y"] - t["last_y"]) / dt
-                    t["vx"] = alpha * nvx + (1 - alpha) * t["vx"]
-                    t["vy"] = alpha * nvy + (1 - alpha) * t["vy"]
+            if not split_indices:
+                validated.append(t)
+                continue
 
-                t["points"].append(
-                    (fi, d["x"], d["y"], d["area"], d["radius"],
-                     d.get("focus_score", 1.0)))
-                t["last_frame"] = fi
-                t["last_x"] = d["x"]
-                t["last_y"] = d["y"]
-                t["last_area"] = d["area"]
-                matched_dets.add(ci)
+            # Split into fragments
+            boundaries = [0] + split_indices + [len(pts)]
+            for j in range(len(boundaries) - 1):
+                fragment_pts = pts[boundaries[j]:boundaries[j+1]]
+                if len(fragment_pts) >= 2:
+                    validated.append({
+                        "id": t["id"],
+                        "points": fragment_pts,
+                    })
 
-        # Unmatched detections start new tracks
-        for di in range(n_d):
-            if di not in matched_dets:
-                d = dets[di]
-                active.append({
-                    "id": next_id,
-                    "points": [(fi, d["x"], d["y"], d["area"], d["radius"],
-                                d.get("focus_score", 1.0))],
-                    "last_frame": fi,
-                    "last_x": d["x"],
-                    "last_y": d["y"],
-                    "vx": 0.0,
-                    "vy": 0.0,
-                    "last_area": d["area"],
-                })
-                next_id += 1
-
-        return active, finished, next_id
+        return validated
 
     # ── Track fragment merging ──────────────────────────────────────────────
 
@@ -433,7 +503,7 @@ class BubbleTracker:
         Merge temporally adjacent, spatially compatible track fragments.
 
         Uses velocity extrapolation to predict where a track's continuation
-        should start, then matches nearby fragment starts via KD-tree.
+        should start, then matches nearby fragment starts.
         """
         max_gap = cfg["merge_max_gap_frames"]
         max_dist = cfg["merge_max_distance_px"]
@@ -449,7 +519,6 @@ class BubbleTracker:
         consumed = set()
         n = len(tracks)
 
-        # Index tracks by start_frame
         sf_index = {}
         for idx, t in enumerate(tracks):
             sf = t["start_frame"]
@@ -462,7 +531,6 @@ class BubbleTracker:
                 continue
             ti = tracks[i]
 
-            # End velocity
             if len(ti["points"]) >= 2:
                 p1, p2 = ti["points"][-2], ti["points"][-1]
                 df = p2[0] - p1[0]
@@ -568,13 +636,12 @@ def tracks_to_csv(tracks, fps, px_per_mm, filepath, velocity_window=5):
             "x_px", "y_px", "x_mm", "y_mm",
             "area_px2", "radius_px", "radius_um",
             "cumulative_dist_mm", "inst_velocity_mm_per_s",
-            "focus_score",
+            "ncc_score",
         ])
         for track in tracks:
             tid = track["id"]
             pts = track["points"]
 
-            # Pre-compute raw velocities
             raw_vels = []
             for j in range(len(pts)):
                 if j == 0:
@@ -587,7 +654,6 @@ def tracks_to_csv(tracks, fps, px_per_mm, filepath, velocity_window=5):
                     dt = (pts[j][0] - p[0]) / fps
                     raw_vels.append(seg / dt if dt > 0 else 0.0)
 
-            # Median-filter velocities (skip index 0)
             if len(raw_vels) > 1:
                 smoothed = [0.0] + _median_filter_velocities(
                     raw_vels[1:], velocity_window)
@@ -597,7 +663,7 @@ def tracks_to_csv(tracks, fps, px_per_mm, filepath, velocity_window=5):
             cum = 0.0
             for j, pt in enumerate(pts):
                 fr, x, y, area, rad = pt[0], pt[1], pt[2], pt[3], pt[4]
-                fscore = pt[5] if len(pt) > 5 else 1.0
+                ncc = pt[5] if len(pt) > 5 else 1.0
                 t_ms = fr / fps * 1000.0
                 x_mm = x / px_per_mm
                 y_mm = y / px_per_mm
@@ -612,7 +678,7 @@ def tracks_to_csv(tracks, fps, px_per_mm, filepath, velocity_window=5):
                     f"{x:.2f}", f"{y:.2f}", f"{x_mm:.5f}", f"{y_mm:.5f}",
                     f"{area:.1f}", f"{rad:.2f}", f"{rad_um:.2f}",
                     f"{cum:.5f}", f"{smoothed[j]:.4f}",
-                    f"{fscore:.3f}",
+                    f"{ncc:.3f}",
                 ])
 
 
@@ -623,7 +689,7 @@ def tracks_to_json(tracks, fps, px_per_mm, filepath, velocity_window=5):
         cum = 0.0
         for j, pt in enumerate(track["points"]):
             fr, x, y, area, rad = pt[0], pt[1], pt[2], pt[3], pt[4]
-            fscore = pt[5] if len(pt) > 5 else 1.0
+            ncc = pt[5] if len(pt) > 5 else 1.0
             if j > 0:
                 p = track["points"][j - 1]
                 cum += np.hypot(
@@ -637,7 +703,7 @@ def tracks_to_json(tracks, fps, px_per_mm, filepath, velocity_window=5):
                 "area_px2": round(area, 1),
                 "radius_um": round(rad / px_per_mm * 1000, 2),
                 "cumulative_dist_mm": round(cum, 5),
-                "focus_score": round(fscore, 3),
+                "ncc_score": round(ncc, 3),
             })
         data["tracks"].append(td)
     with open(filepath, "w") as f:
@@ -676,7 +742,6 @@ def generate_summary(results, px_per_mm, mag_label):
             if dt > 0:
                 vels.append(seg / dt)
 
-        # Apply median filter to velocities for summary stats
         if vels:
             smoothed = _median_filter_velocities(vels)
         else:
@@ -743,7 +808,7 @@ def plot_velocity_profiles(results, px_per_mm, fig=None):
     fig.clear()
     ax = fig.add_subplot(111)
     fps = results["fps"]
-    vel_window = 5  # median filter window
+    vel_window = 5
 
     for i, track in enumerate(results["moving_tracks"]):
         color = TRACK_COLORS[i % len(TRACK_COLORS)]
@@ -758,7 +823,6 @@ def plot_velocity_profiles(results, px_per_mm, fig=None):
                 times.append(t_ms)
                 raw_vels.append(np.hypot(dx, dy) / dt * 1000)
 
-        # Median-filter for smooth plots
         if raw_vels:
             smoothed = _median_filter_velocities(raw_vels, vel_window)
             ax.plot(times, smoothed, color=color, lw=1, alpha=0.8,
