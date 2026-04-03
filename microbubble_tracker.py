@@ -379,23 +379,24 @@ class SettingsDialog(QDialog):
     PARAMS = [
         # Background model
         ("bg_n_samples",           "Background sample frames",               int),
-        # Detection
+        # Detection (track spawning)
         ("bg_sub_threshold",       "Background subtract threshold",          int),
         ("min_contrast",           "Min contrast vs background",             int),
         ("min_circularity",        "Min circularity (0-1)",                  float),
         ("min_blob_area_px",       "Min blob area (px^2)",                   int),
         ("max_blob_area_px",       "Max blob area (px^2)",                   int),
         ("morph_kernel_size",      "Morphology kernel (px)",                 int),
-        # Focus quality
-        ("min_fill_ratio",         "Min fill ratio (0-1)",                   float),
-        ("min_solidity",           "Min solidity (0-1, 0=off)",              float),
-        ("min_focus_score",        "Min focus score (0-1, 0=off)",           float),
-        ("focus_cost_weight",      "Focus cost weight (linking)",            float),
-        # Linking
-        ("max_link_distance_px",   "Max linking distance (px)",              int),
-        ("max_frame_skip",         "Max frame gap for linking",              int),
+        # Template tracking
+        ("patch_size",             "Template patch size (px, odd)",          int),
+        ("search_margin_px",       "Search margin around prediction (px)",   int),
+        ("min_ncc",                "Min template match score (0-1)",         float),
+        ("template_adapt_rate",    "Template adaptation rate (0-1)",         float),
+        ("spawn_interval",         "Spawn new tracks every N frames",        int),
+        ("spawn_min_distance_px",  "Min distance to spawn near track (px)", int),
+        ("max_frame_skip",         "Max lost frames before termination",     int),
         ("velocity_alpha",         "Velocity EMA alpha",                     float),
-        ("area_cost_weight",       "Area cost weight (tie-breaking)",        float),
+        # Track validation
+        ("max_acceleration_px",    "Max acceleration (px/frame^2)",          float),
         # Track classification
         ("min_track_length",       "Min track length (detections)",          int),
         ("min_displacement_px",    "Min displacement for 'moving' (px)",     float),

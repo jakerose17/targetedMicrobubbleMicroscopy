@@ -387,10 +387,10 @@ def fig_linking(cap, n_frames, fi_start, label, mag, px_per_mm):
         frames_gray.append(gray)
         frames_dets.append(dets)
 
-    # Run simple linking across these frames
-    max_dist = cfg["max_link_distance_px"]
+    # Run simple linking across these frames (for visualization only)
+    max_dist = cfg.get("max_link_distance_px", cfg.get("search_margin_px", 12))
     alpha = cfg["velocity_alpha"]
-    area_w = cfg["area_cost_weight"]
+    area_w = cfg.get("area_cost_weight", 2.0)
 
     active = []
     all_tracks = {}  # id -> list of (frame_offset, x, y, color)
