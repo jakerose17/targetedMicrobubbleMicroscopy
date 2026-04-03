@@ -62,6 +62,11 @@ DEFAULT_CONFIG = {
     "min_blob_area_px":     5,       # minimum contour area
     "max_blob_area_px":     5000,    # maximum contour area
     "morph_kernel_size":    3,       # morphological cleanup kernel
+    # Focus quality (out-of-focus ring rejection)
+    "min_fill_ratio":       0.35,   # min contour_area / enclosing_circle_area
+    "min_solidity":         0.0,    # min contour_area / convex_hull_area (0=off)
+    "min_focus_score":      0.0,    # min composite focus score (0=off)
+    "focus_cost_weight":    1.5,    # penalty in linking cost for low focus score
     # Linking
     "max_link_distance_px": 12,      # max distance for frame-to-frame linking
     "max_frame_skip":       3,       # max frames a track can skip
@@ -231,6 +236,9 @@ class BubbleTracker:
         max_area = cfg["max_blob_area_px"]
         min_contrast = cfg["min_contrast"]
         min_circ = cfg["min_circularity"]
+        min_fill = cfg.get("min_fill_ratio", 0)
+        min_sol = cfg.get("min_solidity", 0)
+        min_fscore = cfg.get("min_focus_score", 0)
 
         # Background subtraction: bubbles are darker than background
         diff = cv2.subtract(background, gray)  # clips negative to 0
@@ -276,6 +284,37 @@ class BubbleTracker:
             if contrast < min_contrast:
                 continue
 
+            # Focus-quality features (distinguish solid dots from rings)
+            _, enc_radius = cv2.minEnclosingCircle(c)
+            enc_area = np.pi * enc_radius * enc_radius
+            fill_ratio = area / enc_area if enc_area > 0 else 0
+
+            if fill_ratio < min_fill:
+                continue
+
+            hull = cv2.convexHull(c)
+            hull_area = cv2.contourArea(hull)
+            solidity = area / hull_area if hull_area > 0 else 0
+
+            if solidity < min_sol:
+                continue
+
+            # Peak intensity difference within contour
+            diff_roi = diff[y:y+h, x:x+w]
+            peak_diff = float(np.max(diff_roi, where=roi_mask > 0,
+                                     initial=0))
+
+            # Composite focus score (0-1)
+            norm_contrast = min(contrast / 30.0, 1.0)
+            norm_fill = min(fill_ratio / 0.7, 1.0)
+            norm_solidity = min(solidity / 0.95, 1.0)
+            norm_peak = min(peak_diff / 40.0, 1.0)
+            focus_score = (0.30 * norm_contrast + 0.35 * norm_fill
+                           + 0.15 * norm_solidity + 0.20 * norm_peak)
+
+            if focus_score < min_fscore:
+                continue
+
             dets.append({
                 "x": cx,
                 "y": cy,
@@ -283,6 +322,10 @@ class BubbleTracker:
                 "radius": np.sqrt(area / np.pi),
                 "intensity": mean_int,
                 "contrast": contrast,
+                "fill_ratio": fill_ratio,
+                "solidity": solidity,
+                "peak_diff": peak_diff,
+                "focus_score": focus_score,
             })
 
         return dets
@@ -301,6 +344,7 @@ class BubbleTracker:
         max_skip = cfg["max_frame_skip"]
         alpha = cfg["velocity_alpha"]
         area_w = cfg["area_cost_weight"]
+        focus_w = cfg.get("focus_cost_weight", 0)
 
         # Expire stale tracks
         still_active = []
@@ -334,7 +378,9 @@ class BubbleTracker:
                     # Area ratio penalty to break ties
                     area_ratio = (max(t["last_area"], d["area"]) /
                                   max(min(t["last_area"], d["area"]), 1))
-                    cost[ti, di] = dist + area_w * (area_ratio - 1.0)
+                    focus_penalty = focus_w * (1.0 - d.get("focus_score", 1.0))
+                    cost[ti, di] = (dist + area_w * (area_ratio - 1.0)
+                                    + focus_penalty)
 
             row_ind, col_ind = linear_sum_assignment(cost)
 
@@ -352,7 +398,8 @@ class BubbleTracker:
                     t["vy"] = alpha * nvy + (1 - alpha) * t["vy"]
 
                 t["points"].append(
-                    (fi, d["x"], d["y"], d["area"], d["radius"]))
+                    (fi, d["x"], d["y"], d["area"], d["radius"],
+                     d.get("focus_score", 1.0)))
                 t["last_frame"] = fi
                 t["last_x"] = d["x"]
                 t["last_y"] = d["y"]
@@ -365,7 +412,8 @@ class BubbleTracker:
                 d = dets[di]
                 active.append({
                     "id": next_id,
-                    "points": [(fi, d["x"], d["y"], d["area"], d["radius"])],
+                    "points": [(fi, d["x"], d["y"], d["area"], d["radius"],
+                                d.get("focus_score", 1.0))],
                     "last_frame": fi,
                     "last_x": d["x"],
                     "last_y": d["y"],
@@ -520,6 +568,7 @@ def tracks_to_csv(tracks, fps, px_per_mm, filepath, velocity_window=5):
             "x_px", "y_px", "x_mm", "y_mm",
             "area_px2", "radius_px", "radius_um",
             "cumulative_dist_mm", "inst_velocity_mm_per_s",
+            "focus_score",
         ])
         for track in tracks:
             tid = track["id"]
@@ -546,7 +595,9 @@ def tracks_to_csv(tracks, fps, px_per_mm, filepath, velocity_window=5):
                 smoothed = raw_vels
 
             cum = 0.0
-            for j, (fr, x, y, area, rad) in enumerate(pts):
+            for j, pt in enumerate(pts):
+                fr, x, y, area, rad = pt[0], pt[1], pt[2], pt[3], pt[4]
+                fscore = pt[5] if len(pt) > 5 else 1.0
                 t_ms = fr / fps * 1000.0
                 x_mm = x / px_per_mm
                 y_mm = y / px_per_mm
@@ -561,6 +612,7 @@ def tracks_to_csv(tracks, fps, px_per_mm, filepath, velocity_window=5):
                     f"{x:.2f}", f"{y:.2f}", f"{x_mm:.5f}", f"{y_mm:.5f}",
                     f"{area:.1f}", f"{rad:.2f}", f"{rad_um:.2f}",
                     f"{cum:.5f}", f"{smoothed[j]:.4f}",
+                    f"{fscore:.3f}",
                 ])
 
 
@@ -569,7 +621,9 @@ def tracks_to_json(tracks, fps, px_per_mm, filepath, velocity_window=5):
     for track in tracks:
         td = {"id": track["id"], "points": []}
         cum = 0.0
-        for j, (fr, x, y, area, rad) in enumerate(track["points"]):
+        for j, pt in enumerate(track["points"]):
+            fr, x, y, area, rad = pt[0], pt[1], pt[2], pt[3], pt[4]
+            fscore = pt[5] if len(pt) > 5 else 1.0
             if j > 0:
                 p = track["points"][j - 1]
                 cum += np.hypot(
@@ -583,6 +637,7 @@ def tracks_to_json(tracks, fps, px_per_mm, filepath, velocity_window=5):
                 "area_px2": round(area, 1),
                 "radius_um": round(rad / px_per_mm * 1000, 2),
                 "cumulative_dist_mm": round(cum, 5),
+                "focus_score": round(fscore, 3),
             })
         data["tracks"].append(td)
     with open(filepath, "w") as f:
