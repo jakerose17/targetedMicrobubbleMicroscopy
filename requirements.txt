@@ -2,5 +2,4 @@ opencv-python
 numpy
 scipy
 matplotlib
-tkinterdnd2
-pyqt6
+PyQt6
