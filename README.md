@@ -143,5 +143,4 @@ are kept as a showcase; the source videos are not, so this step is optional.)
 
 ## License
 
-No license file is currently included. Add one if you intend to share or
-distribute this project.
+Released under the [MIT License](LICENSE).
